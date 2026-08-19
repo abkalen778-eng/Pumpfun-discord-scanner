@@ -16,7 +16,7 @@ import websockets
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("pump-scanner")
+log = logging.getLogger("market-scanner")
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
@@ -29,12 +29,20 @@ MIN_5M_VOLUME_USD = float(os.getenv("MIN_5M_VOLUME_USD", "3000"))
 MAX_TOP_HOLDER_PCT = float(os.getenv("MAX_TOP_HOLDER_PCT", "35"))
 ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "30"))
 
+OIL_SYMBOL = os.getenv("OIL_SYMBOL", "CL=F")
+OIL_ALERT_SCORE = int(os.getenv("OIL_ALERT_SCORE", "72"))
+OIL_CHECK_SECONDS = int(os.getenv("OIL_CHECK_SECONDS", "300"))
+OIL_ALERT_COOLDOWN_MINUTES = int(os.getenv("OIL_ALERT_COOLDOWN_MINUTES", "60"))
+
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 seen_alerts: dict[str, float] = {}
+last_oil_alert_at = 0.0
+last_oil_alert_direction = ""
 
 
 @dataclass
@@ -56,8 +64,25 @@ class Analysis:
     reasons: tuple[str, ...] = ()
 
 
+@dataclass
+class OilSignal:
+    price: float
+    score: int
+    direction: str
+    confidence: int
+    rsi: float
+    ema9: float
+    ema21: float
+    macd: float
+    change_30m: float
+    change_2h: float
+    volume_ratio: float
+    reasons: tuple[str, ...]
+    market_time: Optional[int] = None
+
+
 async def get_json(session: aiohttp.ClientSession, url: str, **kwargs):
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), **kwargs) as r:
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=12), **kwargs) as r:
         if r.status != 200:
             return None
         return await r.json()
@@ -230,6 +255,205 @@ def make_embed(a: Analysis, title="Pump.fun Scanner Alert") -> discord.Embed:
     return e
 
 
+def ema(values: list[float], period: int) -> float:
+    if not values:
+        return 0.0
+    alpha = 2.0 / (period + 1)
+    value = values[0]
+    for x in values[1:]:
+        value = alpha * x + (1 - alpha) * value
+    return value
+
+
+def rsi(values: list[float], period: int = 14) -> float:
+    if len(values) <= period:
+        return 50.0
+    gains = []
+    losses = []
+    for i in range(-period, 0):
+        delta = values[i] - values[i - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def pct_change(current: float, previous: float) -> float:
+    return ((current / previous) - 1.0) * 100.0 if previous else 0.0
+
+
+async def fetch_oil_candles() -> tuple[list[float], list[float], Optional[int]]:
+    params = {"interval": "5m", "range": "5d", "includePrePost": "true"}
+    headers = {"User-Agent": "Mozilla/5.0 OilDiscordScanner/1.0"}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        data = await get_json(session, YAHOO_CHART_URL.format(symbol=OIL_SYMBOL), params=params)
+    result = (((data or {}).get("chart") or {}).get("result") or [])
+    if not result:
+        raise RuntimeError("WTI market data is unavailable right now")
+    r0 = result[0]
+    timestamps = r0.get("timestamp") or []
+    quote = (((r0.get("indicators") or {}).get("quote") or [{}])[0])
+    closes_raw = quote.get("close") or []
+    volumes_raw = quote.get("volume") or []
+    closes: list[float] = []
+    volumes: list[float] = []
+    valid_times: list[int] = []
+    for ts, close, vol in zip(timestamps, closes_raw, volumes_raw):
+        if close is None:
+            continue
+        closes.append(float(close))
+        volumes.append(float(vol or 0))
+        valid_times.append(int(ts))
+    if len(closes) < 30:
+        raise RuntimeError("Not enough WTI candles to calculate a reliable signal")
+    return closes, volumes, valid_times[-1] if valid_times else None
+
+
+async def analyze_oil() -> OilSignal:
+    closes, volumes, market_time = await fetch_oil_candles()
+    price = closes[-1]
+    ema9_value = ema(closes[-60:], 9)
+    ema21_value = ema(closes[-80:], 21)
+    ema12_value = ema(closes[-80:], 12)
+    ema26_value = ema(closes[-100:], 26)
+    macd_value = ema12_value - ema26_value
+    rsi_value = rsi(closes, 14)
+    change_30m = pct_change(price, closes[-7]) if len(closes) >= 7 else 0.0
+    change_2h = pct_change(price, closes[-25]) if len(closes) >= 25 else 0.0
+
+    recent_vols = [v for v in volumes[-21:-1] if v > 0]
+    baseline_volume = (sum(recent_vols) / len(recent_vols)) if recent_vols else 0.0
+    volume_ratio = (volumes[-1] / baseline_volume) if baseline_volume and volumes[-1] else 1.0
+
+    score = 50
+    reasons: list[str] = []
+
+    if ema9_value > ema21_value:
+        score += 16; reasons.append("9 EMA is above 21 EMA")
+    else:
+        score -= 16; reasons.append("9 EMA is below 21 EMA")
+
+    if price > ema9_value:
+        score += 8; reasons.append("price is above short-term trend")
+    else:
+        score -= 8; reasons.append("price is below short-term trend")
+
+    if macd_value > 0:
+        score += 12; reasons.append("momentum spread is positive")
+    else:
+        score -= 12; reasons.append("momentum spread is negative")
+
+    if 55 <= rsi_value <= 70:
+        score += 10; reasons.append("RSI supports bullish momentum")
+    elif rsi_value > 70:
+        score += 3; reasons.append("RSI is bullish but overbought")
+    elif 30 <= rsi_value <= 45:
+        score -= 10; reasons.append("RSI supports bearish momentum")
+    elif rsi_value < 30:
+        score -= 3; reasons.append("RSI is bearish but oversold")
+
+    if change_30m >= 0.35:
+        score += 10; reasons.append("strong positive 30m price change")
+    elif change_30m >= 0.12:
+        score += 5; reasons.append("positive 30m price change")
+    elif change_30m <= -0.35:
+        score -= 10; reasons.append("strong negative 30m price change")
+    elif change_30m <= -0.12:
+        score -= 5; reasons.append("negative 30m price change")
+
+    if change_2h >= 0.7:
+        score += 10; reasons.append("2h trend is strongly higher")
+    elif change_2h >= 0.25:
+        score += 5; reasons.append("2h trend is higher")
+    elif change_2h <= -0.7:
+        score -= 10; reasons.append("2h trend is strongly lower")
+    elif change_2h <= -0.25:
+        score -= 5; reasons.append("2h trend is lower")
+
+    if volume_ratio >= 1.5:
+        if change_30m > 0:
+            score += 7; reasons.append("volume spike confirms upside move")
+        elif change_30m < 0:
+            score -= 7; reasons.append("volume spike confirms downside move")
+
+    score = max(0, min(100, score))
+    direction = "BULLISH" if score >= 65 else "BEARISH" if score <= 35 else "NEUTRAL"
+    confidence = min(100, abs(score - 50) * 2)
+
+    return OilSignal(
+        price=price,
+        score=score,
+        direction=direction,
+        confidence=confidence,
+        rsi=rsi_value,
+        ema9=ema9_value,
+        ema21=ema21_value,
+        macd=macd_value,
+        change_30m=change_30m,
+        change_2h=change_2h,
+        volume_ratio=volume_ratio,
+        reasons=tuple(reasons),
+        market_time=market_time,
+    )
+
+
+def make_oil_embed(signal: OilSignal, title: str = "WTI Oil Movement Analysis") -> discord.Embed:
+    arrow = "📈" if signal.direction == "BULLISH" else "📉" if signal.direction == "BEARISH" else "➡️"
+    e = discord.Embed(
+        title=f"{arrow} {title}",
+        description=f"**WTI crude futures ({OIL_SYMBOL})**\nCurrent analyzed price: **${signal.price:.2f}**",
+        timestamp=datetime.now(timezone.utc),
+    )
+    e.add_field(name="Bias", value=f"**{signal.direction}**", inline=True)
+    e.add_field(name="Signal score", value=f"**{signal.score}/100**", inline=True)
+    e.add_field(name="Confidence", value=f"{signal.confidence}%", inline=True)
+    e.add_field(name="30m move", value=f"{signal.change_30m:+.2f}%", inline=True)
+    e.add_field(name="2h move", value=f"{signal.change_2h:+.2f}%", inline=True)
+    e.add_field(name="RSI (14)", value=f"{signal.rsi:.1f}", inline=True)
+    e.add_field(name="EMA 9 / 21", value=f"${signal.ema9:.2f} / ${signal.ema21:.2f}", inline=True)
+    e.add_field(name="Momentum spread", value=f"{signal.macd:+.3f}", inline=True)
+    e.add_field(name="Volume vs recent", value=f"{signal.volume_ratio:.2f}x", inline=True)
+    e.add_field(name="Why", value=" • ".join(signal.reasons[:7]), inline=False)
+    e.set_footer(text="Movement-based research signal only. Oil can reverse quickly; this is not a guaranteed prediction or automatic trade.")
+    return e
+
+
+async def maybe_oil_alert():
+    global last_oil_alert_at, last_oil_alert_direction
+    signal = await analyze_oil()
+    strong_bullish = signal.score >= OIL_ALERT_SCORE
+    strong_bearish = signal.score <= (100 - OIL_ALERT_SCORE)
+    if not (strong_bullish or strong_bearish):
+        return
+
+    now = time.time()
+    cooldown = OIL_ALERT_COOLDOWN_MINUTES * 60
+    same_direction = signal.direction == last_oil_alert_direction
+    if same_direction and now - last_oil_alert_at < cooldown:
+        return
+
+    channel = bot.get_channel(ALERT_CHANNEL_ID)
+    if channel:
+        await channel.send(embed=make_oil_embed(signal, title="WTI Oil Movement Alert"))
+        last_oil_alert_at = now
+        last_oil_alert_direction = signal.direction
+        log.info("Sent WTI oil alert: %s score=%s", signal.direction, signal.score)
+
+
+async def oil_monitor():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await maybe_oil_alert()
+        except Exception:
+            log.exception("WTI oil analysis failed")
+        await asyncio.sleep(max(60, OIL_CHECK_SECONDS))
+
+
 async def maybe_alert(mint: str):
     now = time.time()
     last = seen_alerts.get(mint, 0)
@@ -292,12 +516,12 @@ async def on_ready():
         log.info("Synced %d global commands", len(synced))
 
 
-@bot.tree.command(name="ping", description="Check whether the Pump.fun scanner is online.")
+@bot.tree.command(name="ping", description="Check whether the market scanner is online.")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Scanner is online ✅", ephemeral=True)
+    await interaction.response.send_message("Market scanner is online ✅", ephemeral=True)
 
 
-@bot.tree.command(name="settings", description="Show the active scanner thresholds.")
+@bot.tree.command(name="settings", description="Show the active Pump.fun scanner thresholds.")
 async def settings(interaction: discord.Interaction):
     msg = (
         f"**Pump.fun scanner settings**\n"
@@ -313,7 +537,6 @@ async def settings(interaction: discord.Interaction):
 @bot.tree.command(name="testalert", description="Send a test Pump.fun scanner alert.")
 async def testalert(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
-
     embed = discord.Embed(
         title="🚨 Pump.fun Scanner Test Alert",
         description="This is a test alert from your Pump Scanner."
@@ -325,7 +548,6 @@ async def testalert(interaction: discord.Interaction):
     embed.add_field(name="5m Price Change", value="+18.5%", inline=True)
     embed.add_field(name="Buy / Sell", value="42 / 19", inline=True)
     embed.set_footer(text="TEST ONLY — this is not a real token or trading recommendation.")
-
     await interaction.followup.send(embed=embed)
 
 
@@ -341,11 +563,36 @@ async def scan(interaction: discord.Interaction, mint: str):
         await interaction.followup.send(f"Could not analyze that mint: `{exc}`", ephemeral=True)
 
 
+@bot.tree.command(name="oil", description="Analyze current WTI oil price movement.")
+async def oil(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        signal = await analyze_oil()
+        await interaction.followup.send(embed=make_oil_embed(signal))
+    except Exception as exc:
+        log.exception("WTI oil command failed")
+        await interaction.followup.send(f"Could not analyze WTI right now: `{exc}`", ephemeral=True)
+
+
+@bot.tree.command(name="oilsettings", description="Show WTI oil scanner settings.")
+async def oilsettings(interaction: discord.Interaction):
+    msg = (
+        f"**WTI oil scanner settings**\n"
+        f"Market proxy: `{OIL_SYMBOL}`\n"
+        f"Checks every: `{max(60, OIL_CHECK_SECONDS) // 60} minutes`\n"
+        f"Bullish alert score: `≥ {OIL_ALERT_SCORE}`\n"
+        f"Bearish alert score: `≤ {100 - OIL_ALERT_SCORE}`\n"
+        f"Same-direction cooldown: `{OIL_ALERT_COOLDOWN_MINUTES} minutes`"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
 async def main():
     if not DISCORD_BOT_TOKEN:
         raise RuntimeError("DISCORD_BOT_TOKEN is missing. Copy .env.example to .env and add your token.")
     async with bot:
         bot.loop.create_task(pumpportal_listener())
+        bot.loop.create_task(oil_monitor())
         await bot.start(DISCORD_BOT_TOKEN)
 
 
