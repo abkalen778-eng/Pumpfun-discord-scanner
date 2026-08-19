@@ -311,7 +311,25 @@ async def settings(interaction: discord.Interaction):
     )
     await interaction.response.send_message(msg, ephemeral=True)
 
+@bot.tree.command(name="testalert", description="Send a test Pump.fun scanner alert.")
+async def testalert(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🚨 Pump.fun Scanner Test Alert",
+        description="This is a test alert from your Pump Scanner."
+    )
 
+    embed.add_field(name="Token", value="TEST", inline=True)
+    embed.add_field(name="Score", value="85/100", inline=True)
+    embed.add_field(name="Liquidity", value="$25.0K", inline=True)
+    embed.add_field(name="5m Volume", value="$12.0K", inline=True)
+    embed.add_field(name="5m Price Change", value="+18.5%", inline=True)
+    embed.add_field(name="Buy / Sell", value="42 / 19", inline=True)
+
+    embed.set_footer(
+        text="TEST ONLY — this is not a real token or trading recommendation."
+    )
+
+    await interaction.response.send_message(embed=embed)
 @bot.tree.command(name="scan", description="Analyze a Solana token mint address.")
 @app_commands.describe(mint="Solana SPL token mint address")
 async def scan(interaction: discord.Interaction, mint: str):
